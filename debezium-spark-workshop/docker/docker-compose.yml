@@ -1,0 +1,203 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────
+#  Debezium + Spark Workshop — Full Stack
+#  Kafka dùng KRaft mode (không cần Zookeeper)
+#  Services: MySQL · Kafka (KRaft) · Kafka Connect (Debezium)
+#            · Kafka UI · Schema Registry · Spark
+# ─────────────────────────────────────────────
+
+networks:
+  workshop-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  kafka-data:
+
+services:
+
+  # ── MySQL 8.0 (binlog enabled) ──────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: workshop-mysql
+    restart: unless-stopped
+    networks:
+      - workshop-net
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: ecommerce
+      MYSQL_USER: debezium
+      MYSQL_PASSWORD: debezium123
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --expire-logs-days=1
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../data/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka (KRaft mode — không cần Zookeeper) ────────────────
+  # CLUSTER_ID phải là base64 UUID hợp lệ, generate 1 lần và giữ cố định
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: workshop-kafka
+    restart: unless-stopped
+    networks:
+      - workshop-net
+    ports:
+      - "9092:9092"   # external (host → container)
+      - "9101:9101"   # JMX
+    environment:
+      # KRaft — combined mode: broker + controller trong 1 node
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # Listeners
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Topic defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 24
+
+      # KRaft cluster ID (base64 UUID — cố định để volume restart được)
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+      # JMX
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Schema Registry ─────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: workshop-schema-registry
+    restart: unless-stopped
+    networks:
+      - workshop-net
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ── Kafka Connect (Debezium) ────────────────────────────────
+  kafka-connect:
+    image: debezium/connect:2.4
+    container_name: workshop-connect
+    restart: unless-stopped
+    networks:
+      - workshop-net
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: debezium-connect-group
+      CONFIG_STORAGE_TOPIC: _connect.configs
+      OFFSET_STORAGE_TOPIC: _connect.offsets
+      STATUS_STORAGE_TOPIC: _connect.status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ── Kafka UI ─────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: workshop-kafka-ui
+    restart: unless-stopped
+    networks:
+      - workshop-net
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: workshop
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    depends_on:
+      - kafka
+      - kafka-connect
+
+  # ── Spark Master ─────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: workshop-spark-master
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    networks:
+      - workshop-net
+    ports:
+      - "8888:8080"
+      - "7077:7077"
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    volumes:
+      - ../spark:/opt/spark-apps
+      - ../spark/checkpoints:/opt/checkpoints
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Spark Worker ─────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: workshop-spark-worker
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    networks:
+      - workshop-net
+    ports:
+      - "8889:8081"
+    environment:
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      SPARK_NO_DAEMONIZE: "true"
+    volumes:
+      - ../spark:/opt/spark-apps
+      - ../spark/checkpoints:/opt/checkpoints
+    depends_on:
+      spark-master:
+        condition: service_healthy
